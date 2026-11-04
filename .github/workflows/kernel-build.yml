@@ -1,0 +1,149 @@
+name: Jarvis Kernel Build
+run-name: Jarvis Kernel · ${{ inputs.request_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: Request correlation ID
+        required: true
+        type: string
+      repo_url:
+        description: Public HTTPS kernel source repository
+        required: true
+        type: string
+      branch:
+        description: Source branch or tag
+        required: true
+        type: string
+      defconfig:
+        description: arm64 defconfig path, e.g. vendor/onyx_defconfig
+        required: true
+        type: string
+      workspace_name:
+        description: Workspace label
+        required: true
+        type: string
+      build_jobs:
+        description: Parallel build jobs (keep at 2 on this runner)
+        required: true
+        default: '2'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Free, public-repository standard runner: 4 vCPU, 16 GB RAM, 14 GB SSD.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Checkout builder workflows
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Reclaim unused runner image space
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android/sdk /usr/share/dotnet /opt/ghc /usr/local/share/powershell /usr/local/share/chromium || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Validate inputs and install small kernel dependencies
+        env:
+          REPO_URL: ${{ inputs.repo_url }}
+          SOURCE_BRANCH: ${{ inputs.branch }}
+          DEFCONFIG: ${{ inputs.defconfig }}
+          BUILD_JOBS: ${{ inputs.build_jobs }}
+          WORKSPACE_NAME: ${{ inputs.workspace_name }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          from urllib.parse import urlparse
+          u=urlparse(os.environ['REPO_URL'])
+          if u.scheme!='https' or u.hostname not in {'github.com','gitlab.com','android.googlesource.com'} or u.username or u.password or u.query or u.fragment:
+              raise SystemExit('Use a public HTTPS repository on github.com, gitlab.com or android.googlesource.com')
+          if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,119}', os.environ['SOURCE_BRANCH']) or '..' in os.environ['SOURCE_BRANCH']:
+              raise SystemExit('Invalid branch')
+          if not re.fullmatch(r'[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*_defconfig', os.environ['DEFCONFIG']) or '..' in os.environ['DEFCONFIG']:
+              raise SystemExit('Invalid arm64 defconfig path')
+          if os.environ['BUILD_JOBS'] not in {'1','2','3','4'}:
+              raise SystemExit('Build jobs must be between 1 and 4')
+          if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{1,59}', os.environ['WORKSPACE_NAME']):
+              raise SystemExit('Invalid workspace name')
+          PY
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bc bison flex libssl-dev libelf-dev libncurses-dev dwarves device-tree-compiler zip zstd gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
+          command -v clang
+          command -v ld.lld || command -v ld.lld-18
+          df -h /
+
+      - name: Clone trusted public source
+        env:
+          REPO_URL: ${{ inputs.repo_url }}
+          SOURCE_BRANCH: ${{ inputs.branch }}
+          WORKSPACE_NAME: ${{ inputs.workspace_name }}
+        run: |
+          set -euo pipefail
+          git clone --depth=1 --recurse-submodules --shallow-submodules --single-branch --branch "$SOURCE_BRANCH" "$REPO_URL" "$RUNNER_TEMP/$WORKSPACE_NAME"
+          echo "KERNEL_SOURCE=$RUNNER_TEMP/$WORKSPACE_NAME" >> "$GITHUB_ENV"
+          df -h /
+
+      - name: Build arm64 kernel with a conservative job count
+        env:
+          DEFCONFIG: ${{ inputs.defconfig }}
+          BUILD_JOBS: ${{ inputs.build_jobs }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/kernel-out" "$RUNNER_TEMP/jarvis-result"
+          exec > >(tee "$RUNNER_TEMP/jarvis-result/build.log") 2>&1
+          export ARCH=arm64 SUBARCH=arm64 LLVM=1 LLVM_IAS=1
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabihf-
+          make -C "$KERNEL_SOURCE" O="$RUNNER_TEMP/kernel-out" "$DEFCONFIG"
+          make -C "$KERNEL_SOURCE" O="$RUNNER_TEMP/kernel-out" -j"$BUILD_JOBS"
+          mkdir -p "$RUNNER_TEMP/jarvis-result/kernel-output"
+          for p in \
+            arch/arm64/boot/Image arch/arm64/boot/Image.gz arch/arm64/boot/Image.lz4 \
+            arch/arm64/boot/dtbo.img arch/arm64/boot/boot.img \
+            arch/arm64/boot/dts; do
+            for root in "$RUNNER_TEMP/kernel-out" "$KERNEL_SOURCE"; do
+              if [[ -e "$root/$p" ]]; then
+                mkdir -p "$RUNNER_TEMP/jarvis-result/kernel-output/$(dirname "$p")"
+                cp -a "$root/$p" "$RUNNER_TEMP/jarvis-result/kernel-output/$p"
+                break
+              fi
+            done
+          done
+          find "$RUNNER_TEMP/kernel-out" -type f \( -name '*.ko' -o -name 'vmlinux' -o -name 'System.map' -o -name '.config' \) -print0 | while IFS= read -r -d '' f; do
+            rel="${f#"$RUNNER_TEMP/kernel-out/"}"
+            mkdir -p "$RUNNER_TEMP/jarvis-result/kernel-output/$(dirname "$rel")"
+            cp -a "$f" "$RUNNER_TEMP/jarvis-result/kernel-output/$rel"
+          done
+          if ! find "$RUNNER_TEMP/jarvis-result/kernel-output" -type f | grep -q .; then
+            echo 'No recognized kernel outputs found. This repository may need a maintainer-specific build recipe.'
+            exit 4
+          fi
+          cd "$RUNNER_TEMP/jarvis-result"
+          zip -qr kernel-output.zip kernel-output
+          sha256sum kernel-output.zip > kernel-output.zip.sha256
+
+      - name: Preserve logs and outputs for Telegram delivery
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/jarvis-result"
+          if [[ -f "$RUNNER_TEMP/jarvis-result/build.log" ]]; then :; else echo 'Build did not reach the build step.' > "$RUNNER_TEMP/jarvis-result/build.log"; fi
+          echo "Request: ${{ inputs.request_id }}" > "$RUNNER_TEMP/jarvis-result/run-info.txt"
+          echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" >> "$RUNNER_TEMP/jarvis-result/run-info.txt"
+
+      - name: Upload result (one-day retention)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jarvis-build-output
+          path: ${{ runner.temp }}/jarvis-result/
+          if-no-files-found: warn
+          retention-days: 1
