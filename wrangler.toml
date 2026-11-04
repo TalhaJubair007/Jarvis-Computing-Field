@@ -1,0 +1,16 @@
+name = "jarvis-telegram-gateway"
+main = "cloudflare-gateway/worker.js"
+compatibility_date = "2026-11-04"
+
+# Add secrets in Cloudflare Dashboard or with `wrangler secret put`.
+# Required secrets:
+# TELEGRAM_BOT_TOKEN
+# TELEGRAM_WEBHOOK_SECRET
+# JARVIS_TELEGRAM_SECRET
+# GITHUB_TOKEN
+# Required variables:
+# TELEGRAM_OWNER_ID
+# JARVIS_WORKER_URL
+# GITHUB_OWNER
+# GITHUB_REPO
+# GITHUB_REF (optional; defaults to main)
